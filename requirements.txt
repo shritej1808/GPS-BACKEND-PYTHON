@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+pymongo
+firebase-admin
+razorpay
+python-dotenv
