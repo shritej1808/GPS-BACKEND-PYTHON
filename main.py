@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 import math, time, os, json
+import razorpay
 
 from pymongo import MongoClient
 from bson import ObjectId
@@ -11,7 +12,6 @@ from bson import ObjectId
 import firebase_admin
 from firebase_admin import credentials, firestore, db, messaging
 
-import razorpay
 
 # =====================================================
 # FIREBASE INIT
@@ -120,18 +120,19 @@ def format_dt_for_output(value) -> Optional[str]:
 
 def normalize_vehicle_id(raw: str) -> str:
     """
-    Remove whitespace/newlines and upper-case the vehicle ID.
-    Fixes 'UP70GT1215\\n' vs 'UP70GT1215'.
+    Strip spaces/newlines and upper-case the vehicle ID.
+    Ensures 'up70gt1215\\n' → 'UP70GT1215'.
     """
-    return raw.strip().upper()
+    if raw is None:
+        return ""
+    return str(raw).strip().upper()
 
 
 # =====================================================
-# SESSION (SINGLE VEHICLE DEMO)
-# Direction-aware
+# GLOBAL SESSION (ONE ACTIVE OCR TRIP AT A TIME)
 # =====================================================
 session = {
-    "vehicle_id": None,
+    "vehicle_id": None,              # Vehicle from OCR /start_trip
     "ocr_detected": False,
     "tracking": False,
     "distance_m": 0.0,
@@ -140,13 +141,16 @@ session = {
     "was_off_road": False,
 
     # Directional segment
-    "direction": None,          # "forward" or "return"
+    "direction": None,               # "forward" or "return"
     "start_lat": None,
     "start_lon": None,
     "end_lat": None,
     "end_lon": None,
     "entry_toll_name": None,
     "exit_toll_name": None,
+
+    # Android login state (for info / OCR coordination, optional)
+    "android_logged_in_vehicle": None,
 }
 
 # =====================================================
@@ -345,9 +349,12 @@ def push_notify(vehicle_id: str, title: str, body: str, data=None):
 
     token = doc["fcm_token"]
 
+    # Merge data with vehicle_id
+    full_data = {**(data or {}), "vehicle_id": clean_vid}
+
     message = messaging.Message(
         notification=messaging.Notification(title=title, body=body),
-        data=data or {},
+        data=full_data,
         token=token
     )
 
@@ -355,13 +362,50 @@ def push_notify(vehicle_id: str, title: str, body: str, data=None):
         response = messaging.send(message)
         print("📩 FCM Sent:", response)
     except Exception as e:
+        # This is usually "Requested entity was not found" when token is stale/invalid
         print("❌ FCM Error:", e)
+
 
 # =====================================================
 # OWNER / DEVICE / VEHICLE REGISTRATION
 # =====================================================
 @app.post("/register_owner")
 def register_owner(payload: RegisterOwner):
+    clean_vid = normalize_vehicle_id(payload.vehicle_id)
+
+    # 1️⃣ Save owner details into devices_col
+    devices_col.update_one(
+        {"vehicle_id": clean_vid},
+        {
+            "$set": {
+                "vehicle_id": clean_vid,
+                "phone_number": payload.phone_number,
+                "owner_name": payload.owner_name,
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$setOnInsert": {"created_at": datetime.now(timezone.utc)},
+        },
+        upsert=True,
+    )
+
+    # 2️⃣ ALSO REGISTER VEHICLE FOR LOGIN (IMPORTANT!)
+    registered_col.update_one(
+        {"vehicle_id": clean_vid},
+        {
+            "$set": {
+                "vehicle_id": clean_vid,
+                "owner_name": payload.owner_name,
+                "phone_number": payload.phone_number,
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$setOnInsert": {"created_at": datetime.now(timezone.utc)},
+        },
+        upsert=True,
+    )
+
+    print(f"✅ FULL Registration completed for {clean_vid}")
+    return {"message": "Owner + Vehicle registered successfully"}
+
     clean_vid = normalize_vehicle_id(payload.vehicle_id)
     devices_col.update_one(
         {"vehicle_id": clean_vid},
@@ -383,6 +427,8 @@ def register_owner(payload: RegisterOwner):
 @app.post("/register_device")
 def register_device(payload: RegisterDevice):
     clean_vid = normalize_vehicle_id(payload.vehicle_id)
+    print(f"📱 /register_device for vehicle_id={payload.vehicle_id} → stored as {clean_vid}")
+
     devices_col.update_one(
         {"vehicle_id": clean_vid},
         {
@@ -417,6 +463,37 @@ def register_vehicle(payload: RegisterVehicle):
     print(f"✔ Registered Vehicle: {clean_vid}")
     return {"message": "Vehicle registered for toll tracking"}
 
+
+# =====================================================
+# CHECK VEHICLE LOGIN (ANDROID USES THIS)
+# =====================================================
+@app.post("/check_vehicle")
+def check_vehicle(payload: VehicleData):
+    clean_vid = normalize_vehicle_id(payload.vehicle_id)
+
+    record = registered_col.find_one({"vehicle_id": clean_vid})
+    if not record:
+        print(f"❌ Vehicle {clean_vid} is NOT registered")
+        return {"registered": False}
+
+    # Save Android logged-in vehicle (for info / debugging / OCR coordination)
+    session["android_logged_in_vehicle"] = clean_vid
+    print(f"📱 Android logged-in vehicle set to {clean_vid}")
+
+    return {"registered": True}
+
+
+@app.post("/logout_vehicle")
+def logout_vehicle(payload: VehicleData):
+    clean_vid = normalize_vehicle_id(payload.vehicle_id)
+
+    if session.get("android_logged_in_vehicle") == clean_vid:
+        print(f"📵 Android logout → {clean_vid}")
+        session["android_logged_in_vehicle"] = None
+
+    return {"status": "logged_out"}
+
+
 # =====================================================
 # START TRIP (OCR)
 # =====================================================
@@ -435,6 +512,11 @@ def start_trip(data: VehicleData):
             "message": f"Vehicle {vid} is NOT registered for toll tracking."
         }
 
+    # For debugging: show if we have FCM for this vehicle
+    dev = devices_col.find_one({"vehicle_id": vid})
+    print(f"🔎 Device lookup for {vid}: {'FOUND' if dev else 'NOT FOUND'}")
+
+    # Reset + start new OCR session
     session.update(
         {
             "vehicle_id": vid,
@@ -489,6 +571,7 @@ def start_trip(data: VehicleData):
         "message": "Authorized plate detected. Mobile app triggered to start GPS."
     }
 
+
 # =====================================================
 # RESET TRIP
 # =====================================================
@@ -530,6 +613,7 @@ def reset_distance(data: VehicleData):
 
     return {"message": "Trip reset", "distance_mi": 0.0}
 
+
 # =====================================================
 # UPDATE LOCATION (DIRECTION-AWARE)
 # =====================================================
@@ -563,6 +647,30 @@ async def update_location(request: Request):
 
     print(f"Nearest Zone: {zone_name} ({round(d_zone, 1)}m)")
     print(f"Distance to ENTRY: {round(d_entry, 1)}m | EXIT: {round(d_exit, 1)}m")
+
+    # Reject updates if OCR is tracking a different vehicle
+    if session.get("vehicle_id") and vid != session["vehicle_id"]:
+        print(
+            f"🚫 VEHICLE MISMATCH: app sent {vid} but OCR session vehicle is "
+            f"{session['vehicle_id']}. Update ignored."
+        )
+        miles = session["distance_m"] * METER_TO_MILE
+        toll = miles * TOLL_RATE_PER_MILE
+        print(f"TOTAL DISTANCE (unchanged): {session['distance_m']:.2f} m ({miles:.2f} mi)")
+        print(f"ESTIMATED TOLL: ₹{toll:.2f}")
+        print("------------------------------------------------\n")
+
+        return {
+            "event": (
+                f"Vehicle mismatch. OCR started for {session['vehicle_id']}, "
+                f"but this app is logged in as {vid}. Please login with "
+                f"{session['vehicle_id']} or reset trip."
+            ),
+            "tracking": session["tracking"],
+            "nearest_zone": {"name": zone_name, "distance_m": round(d_zone, 1)},
+            "total_distance_mi": round(miles, 2),
+            "toll_estimate": round(toll, 2),
+        }
 
     if accuracy > ACCURACY_LIMIT:
         print(f"⚠ Poor accuracy {accuracy}m > {ACCURACY_LIMIT}m → Update ignored")
@@ -598,9 +706,11 @@ async def update_location(request: Request):
             session["entry_toll_name"] = ENTRY_TOLL_NAME
             session["exit_toll_name"] = EXIT_TOLL_NAME
 
-            t, _ = project_to_segment(lat, lon,
-                                      session["start_lat"], session["start_lon"],
-                                      session["end_lat"], session["end_lon"])
+            t, _ = project_to_segment(
+                lat, lon,
+                session["start_lat"], session["start_lon"],
+                session["end_lat"], session["end_lon"]
+            )
             session["last_t"] = t
 
             event = "🟢 Trip started (Dharwad → Hubballi)"
@@ -642,9 +752,11 @@ async def update_location(request: Request):
             session["entry_toll_name"] = EXIT_TOLL_NAME
             session["exit_toll_name"] = ENTRY_TOLL_NAME
 
-            t, _ = project_to_segment(lat, lon,
-                                      session["start_lat"], session["start_lon"],
-                                      session["end_lat"], session["end_lon"])
+            t, _ = project_to_segment(
+                lat, lon,
+                session["start_lat"], session["start_lon"],
+                session["end_lat"], session["end_lon"]
+            )
             session["last_t"] = t
 
             event = "🟢 Trip started (Hubballi → Dharwad)"
@@ -879,6 +991,7 @@ async def update_location(request: Request):
         "toll_estimate": round(toll, 2),
     }
 
+
 # =====================================================
 # RAZORPAY PAYMENT APIs (APP FLOW)
 # =====================================================
@@ -970,6 +1083,7 @@ def verify_payment(payload: VerifyPaymentRequest):
         "payment_id": payload.payment_id,
     }
 
+
 # =====================================================
 # RAZORPAY WEBHOOK (REAL SIGNATURE CHECK)
 # =====================================================
@@ -1058,6 +1172,15 @@ async def razorpay_webhook(request: Request):
     print("ℹ️ Webhook event ignored (not payment.captured)")
     return {"status": "ignored", "event": event}
 
+
+# =====================================================
+# SMALL HELPER FOR OCR / DEBUGGING
+# =====================================================
+@app.get("/get_logged_in_vehicle")
+def get_logged_in_vehicle():
+    return {"vehicle_id": session.get("android_logged_in_vehicle")}
+
+
 # =====================================================
 # TRIP HISTORY
 # =====================================================
@@ -1066,6 +1189,8 @@ def trip_history(vehicle_id: str):
     trips = get_trips_for_vehicle(vehicle_id)
     clean_vid = normalize_vehicle_id(vehicle_id)
     return {"vehicle_id": clean_vid, "trips": trips}
+
+
 # =====================================================
 # SESSION STATE (for OCR script reset)
 # =====================================================
