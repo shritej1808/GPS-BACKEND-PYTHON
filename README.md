@@ -260,13 +260,4 @@ Perfect for **final-year projects, startups, or interviews**.
 
 ---
 
-## 📜 License
 
-MIT License
-Free to use, modify, and extend 🚀
-
-* 📊 Draw an **architecture diagram**
-* 🧑‍💻 Write **API docs** for Swagger
-* 🎯 Optimize wording for **placements / recruiters**
-
-Just say **“do it”** 😄
