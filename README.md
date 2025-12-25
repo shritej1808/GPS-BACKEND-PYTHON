@@ -265,11 +265,6 @@ Perfect for **final-year projects, startups, or interviews**.
 MIT License
 Free to use, modify, and extend 🚀
 
----
-
-If you want next, I can:
-
-* 🔥 Combine **Android + Backend** into a **single master README**
 * 📊 Draw an **architecture diagram**
 * 🧑‍💻 Write **API docs** for Swagger
 * 🎯 Optimize wording for **placements / recruiters**
